@@ -858,7 +858,8 @@ pub(crate) struct Renderer {
     /// Soft masks drawn during this render. PdfCraft note: it belongs to one `Renderer` (one
     /// render, every nested renderer starting empty) and so to one `preview` setting: a mask
     /// drawn for a preview, which may leave out tiny images, never reaches a final render.
-    pub(crate) soft_mask_cache: HashMap<u128, Mask>,
+    /// PdfCraft patch (36): what they hold counts against [`MAX_HELD_MASK_PIXELS`].
+    pub(crate) soft_mask_cache: SoftMasks,
     /// PdfCraft patch (30): coloured tiling cells drawn during this render (see [`TilingCells`]).
     /// Like `soft_mask_cache` it belongs to one renderer, so to one `preview` setting.
     tiling_cells: TilingCells,
@@ -873,6 +874,87 @@ pub(crate) struct Renderer {
     /// PdfCraft patch (27): set while this renderer draws one ink pass of a group blending
     /// in `DeviceCMYK` (see [`Renderer::draw_isolated_cmyk_group`]).
     ink: InkState,
+}
+
+/// PdfCraft patch (36): the most soft-mask pixels (a byte each) the renderers on one thread
+/// hold at once, 2^28 (256 MiB; 64 masks of a 2000 × 2000 canvas). Every mask is the size of the
+/// canvas, and the scene keeps each one it is painted with until it is composited, cached or
+/// not, so bounding the cache alone would bound nothing. The cache key holds the CTM, so a page
+/// setting one soft mask under a slightly different matrix for each fill drew and held a new
+/// mask a fill: 4 MB each on a 2000 × 2000 canvas, until the process ran out of memory. Past the
+/// budget, content under a soft mask not yet drawn is left out (painted through an empty mask)
+/// and the page says so (`InterpreterWarning::ContentTruncated`); masks already drawn are
+/// still taken from the cache.
+pub const MAX_HELD_MASK_PIXELS: u64 = 1 << 28;
+
+thread_local! {
+    /// PdfCraft patch (36): the soft-mask pixels the live renderers on this thread hold.
+    static HELD_MASK_PIXELS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// PdfCraft patch (36): whether content was left out over [`MAX_HELD_MASK_PIXELS`] since
+    /// the last [`take_masks_left_out`].
+    static MASKS_LEFT_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// PdfCraft patch (36): whether content was left out over [`MAX_HELD_MASK_PIXELS`] since the
+/// last call; the page render clears it before drawing and reports it after.
+pub(crate) fn take_masks_left_out() -> bool {
+    MASKS_LEFT_OUT.try_with(|c| c.replace(false)).unwrap_or(false)
+}
+
+/// PdfCraft patch (36): the soft masks one renderer drew, by `SoftMask::cache_key`, and the
+/// pixels they hold against [`MAX_HELD_MASK_PIXELS`] until the renderer is dropped.
+#[derive(Default)]
+pub(crate) struct SoftMasks {
+    masks: HashMap<u128, Mask>,
+    held: u64,
+    /// The mask that paints nothing, used past the budget; made once, the first time.
+    empty: Option<Mask>,
+}
+
+impl SoftMasks {
+    /// The `width` × `height` mask of `mask`, drawn the first time, or one that paints nothing
+    /// when drawing it would go past [`MAX_HELD_MASK_PIXELS`].
+    fn get(&mut self, mask: &SoftMask<'_>, settings: RenderSettings, width: u16, height: u16, preview: bool) -> Mask {
+        let key = mask.cache_key();
+        if let Some(drawn) = self.masks.get(&key) {
+            return drawn.clone();
+        }
+        let pixels = u64::from(width) * u64::from(height);
+        let fits = HELD_MASK_PIXELS
+            .try_with(|held| {
+                let total = held.get().saturating_add(pixels);
+                let fits = total <= MAX_HELD_MASK_PIXELS;
+                if fits {
+                    held.set(total);
+                }
+                fits
+            })
+            .unwrap_or(false);
+        if !fits {
+            let _ = MASKS_LEFT_OUT.try_with(|c| c.set(true));
+            return self
+                .empty
+                .get_or_insert_with(|| {
+                    // Zeroed memory is mapped lazily, and every refused mask shares this one. The
+                    // length is `width × height`, as `from_parts` requires.
+                    let len = usize::from(width) * usize::from(height);
+                    Mask::from_parts(vec![0; len], width, height)
+                })
+                .clone();
+        }
+        self.held = self.held.saturating_add(pixels);
+        let drawn = draw_soft_mask(mask, settings, width, height, preview);
+        self.masks.insert(key, drawn.clone());
+        drawn
+    }
+}
+
+impl Drop for SoftMasks {
+    /// PdfCraft patch (36): the renderer and its scene are gone, and the masks with them.
+    fn drop(&mut self) {
+        let held = self.held;
+        let _ = HELD_MASK_PIXELS.try_with(|h| h.set(h.get().saturating_sub(held)));
+    }
 }
 
 /// PdfCraft patch (30): the cell pixmaps of coloured tiling patterns, keyed by the setting of the
@@ -1006,7 +1088,7 @@ impl Renderer {
             knockout_passes: Vec::new(),
             erase_groups: 0,
             inside_pattern: false,
-            soft_mask_cache: HashMap::default(),
+            soft_mask_cache: SoftMasks::default(),
             tiling_cells: TilingCells::default(),
             outline_cache: cache.outline_cache.clone(),
             cur_mask: None,
@@ -1113,7 +1195,7 @@ impl Renderer {
                 knockout_passes: Vec::new(),
                 erase_groups: 0,
                 inside_pattern: false,
-                soft_mask_cache: HashMap::default(),
+                soft_mask_cache: SoftMasks::default(),
                 tiling_cells: TilingCells::default(),
                 outline_cache: self.outline_cache.clone(),
                 cur_mask: None,
@@ -1661,7 +1743,7 @@ impl Renderer {
             erase_groups: 0,
             cur_mask: None,
             inside_pattern: true,
-            soft_mask_cache: HashMap::default(),
+            soft_mask_cache: SoftMasks::default(),
             tiling_cells: TilingCells::default(),
             outline_cache: self.outline_cache.clone(),
             in_type3_glyph: false,
@@ -1726,7 +1808,7 @@ impl Renderer {
             color_replacement: None,
             in_annotations: self.in_annotations,
             inside_pattern: self.inside_pattern,
-            soft_mask_cache: HashMap::default(),
+            soft_mask_cache: SoftMasks::default(),
             tiling_cells: TilingCells::default(),
             outline_cache: self.outline_cache.clone(),
             cur_mask: None,
@@ -2569,10 +2651,7 @@ impl<'a> Device<'a> for Renderer {
                 let width = self.ctx.width();
                 let height = self.ctx.height();
 
-                self.soft_mask_cache
-                    .entry(m.cache_key())
-                    .or_insert_with(|| draw_soft_mask(&m, settings, width, height, self.preview))
-                    .clone()
+                self.soft_mask_cache.get(&m, settings, width, height, self.preview)
             }),
             None,
         );
@@ -2698,10 +2777,7 @@ impl<'a> Device<'a> for Renderer {
             let width = self.ctx.width();
             let height = self.ctx.height();
 
-            self.soft_mask_cache
-                .entry(m.cache_key())
-                .or_insert_with(|| draw_soft_mask(&m, settings, width, height, self.preview))
-                .clone()
+            self.soft_mask_cache.get(&m, settings, width, height, self.preview)
         });
         if let Some(mask) = self.cur_mask.clone() {
             self.ctx.set_mask(mask);
@@ -2898,7 +2974,7 @@ fn draw_soft_mask(mask: &SoftMask<'_>, settings: RenderSettings, width: u16, hei
         erase_groups: 0,
         inside_pattern: false,
         cur_mask: None,
-        soft_mask_cache: HashMap::default(),
+        soft_mask_cache: SoftMasks::default(),
         tiling_cells: TilingCells::default(),
         outline_cache: Rc::new(std::cell::RefCell::new(HashMap::new())),
         in_type3_glyph: false,

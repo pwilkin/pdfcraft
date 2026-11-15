@@ -68,9 +68,9 @@ pub use renderer::set_skip_offscreen_paths;
 /// PdfCraft patch (27): exported for its regression test.
 #[doc(hidden)]
 pub use renderer::set_cmyk_band_pixels;
-/// PdfCraft patch (30): exported for its regression tests.
+/// PdfCraft patches (30) and (36): exported for their regression tests.
 #[doc(hidden)]
-pub use renderer::{OffscreenDraws, offscreen_draws};
+pub use renderer::{MAX_HELD_MASK_PIXELS, OffscreenDraws, offscreen_draws};
 
 /// A cache used by the renderer.
 ///
@@ -298,10 +298,13 @@ pub fn render_into<'a>(
         device.push_transparency_group(1.0, None, BlendMode::Normal);
     }
 
+    // PdfCraft patch (36): only this page's soft masks count toward the report below.
+    renderer::take_masks_left_out();
     interpret_page(page, &mut state, &mut device);
     // PdfCraft patch (31): what the rasterizer left out once its coverage was full (a page that
     // paints the same content millions of times over) is content left out, said as such.
-    if device.ctx.coverage_full() {
+    // PdfCraft patch (36): so is content under soft masks past `MAX_HELD_MASK_PIXELS`.
+    if device.ctx.coverage_full() | renderer::take_masks_left_out() {
         (interpreter_settings.warning_sink)(hayro_interpret::InterpreterWarning::ContentTruncated);
     }
 
