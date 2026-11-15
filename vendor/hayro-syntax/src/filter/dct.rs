@@ -29,6 +29,10 @@ pub(crate) fn decode(
         .set_max_height(u16::MAX as usize);
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(&*data), options);
     decoder.decode_headers().ok()?;
+    let (jpeg_width, jpeg_height) = decoder.dimensions()?;
+    if !decoded_size_ok(jpeg_width, jpeg_height, image_params) {
+        return None;
+    }
 
     let color_transform = params.get::<u8>(COLOR_TRANSFORM);
     let input_color_space = decoder.input_colorspace().unwrap();
@@ -178,4 +182,99 @@ fn find_sof_marker(data: &[u8]) -> Option<usize> {
     }
 
     None
+}
+
+/// PdfCraft patch (48): the most pixels a JPEG image may decode to, as `image_size_ok` allows.
+const MAX_DECODED_PIXELS: u64 = 1 << 28;
+
+/// PdfCraft patch (48): whether the frame the decoder read, `width` × `height`, may be decoded:
+/// no larger than the image dictionary's size (which [`maybe_patch_jpeg_dimensions`] makes it),
+/// and at most [`MAX_DECODED_PIXELS`]. That patch finds the frame header with its own scanner,
+/// which may read the markers differently from the decoder: it takes `FF 01` (TEM) as standalone
+/// while zune-jpeg skips a length after it, so a 1 × 1 frame header inside that segment was
+/// checked while the decoder read a 65535 × 65535 one after it, and aborted on a 12.9 GB
+/// allocation. Checking the decoder's own header holds whichever way the markers are read.
+fn decoded_size_ok(width: usize, height: usize, image_params: &ImageDecodeParams) -> bool {
+    let (Ok(width), Ok(height)) = (u64::try_from(width), u64::try_from(height)) else {
+        return false;
+    };
+    let pixels = width.saturating_mul(height);
+    let image_pixels = u64::from(image_params.width).saturating_mul(u64::from(image_params.height));
+    width > 0 && height > 0 && pixels <= image_pixels && pixels <= MAX_DECODED_PIXELS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DECODED_PIXELS, decode, decoded_size_ok};
+    use crate::object::Dict;
+    use crate::object::stream::ImageDecodeParams;
+    use alloc::vec::Vec;
+
+    /// A baseline JPEG of `components` components whose frame is `width` × `height`, written for
+    /// these tests: one Huffman code per table (DC difference 0, AC end-of-block) and all-zero
+    /// scan data, so every sample is 128 (mid-grey). With `hidden`, a 1 × 1 frame header sits
+    /// inside an `FF 01` (TEM) segment that has a length, before the real one.
+    fn grey_jpeg(width: u16, height: u16, components: u8, hidden: bool) -> Vec<u8> {
+        let mut j = alloc::vec![0xff, 0xd8];
+        if hidden {
+            j.extend_from_slice(&[0xff, 0x01, 0x00, 0x0b]);
+            j.extend_from_slice(&[0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01]);
+        }
+        j.extend_from_slice(&[0xff, 0xc0, 0x00, 8 + 3 * components, 0x08]);
+        j.extend_from_slice(&height.to_be_bytes());
+        j.extend_from_slice(&width.to_be_bytes());
+        j.push(components);
+        for id in 1..=components {
+            j.extend_from_slice(&[id, 0x11, 0x00]);
+        }
+        j.extend_from_slice(&[0xff, 0xdb, 0x00, 0x43, 0x00]);
+        j.extend_from_slice(&[1; 64]);
+        for class in [0x00, 0x10] {
+            j.extend_from_slice(&[0xff, 0xc4, 0x00, 0x14, class, 1]);
+            j.extend_from_slice(&[0; 16]);
+        }
+        j.extend_from_slice(&[0xff, 0xda, 0x00, 6 + 2 * components, components]);
+        for id in 1..=components {
+            j.extend_from_slice(&[id, 0x00]);
+        }
+        j.extend_from_slice(&[0x00, 0x3f, 0x00]);
+        j.extend_from_slice(&[0; 64]);
+        j.extend_from_slice(&[0xff, 0xd9]);
+        j
+    }
+
+    fn params(width: u32, height: u32) -> ImageDecodeParams {
+        ImageDecodeParams { width, height, ..ImageDecodeParams::default() }
+    }
+
+    /// PdfCraft patch (48): the size check reads the frame header that zune-jpeg read, not the
+    /// 1 × 1 one hidden in a TEM segment that the dimension patch's scanner found. Decoding the
+    /// 65535 × 65535 frame aborted the process on a 12.9 GB allocation (three components), or
+    /// took 4.3 GB (one).
+    #[test]
+    fn a_frame_larger_than_the_image_behind_a_tem_segment_is_refused_before_decoding() {
+        for components in [1, 3] {
+            assert!(decode(&grey_jpeg(65535, 65535, components, true), &Dict::empty(), &params(1, 1)).is_none());
+            // The same layout at the image's own size still decodes.
+            let small = decode(&grey_jpeg(8, 8, components, true), &Dict::empty(), &params(8, 8)).unwrap();
+            let image = small.image_data.unwrap();
+            assert_eq!((image.width, image.height), (8, 8));
+            assert_eq!(small.data.len(), 64 * usize::from(components));
+            assert!(small.data.iter().all(|&v| v.abs_diff(128) <= 1), "{components}: {:?}", &small.data[..3]);
+            let plain = decode(&grey_jpeg(8, 8, components, false), &Dict::empty(), &params(8, 8)).unwrap();
+            assert_eq!(plain.data, small.data);
+        }
+    }
+
+    #[test]
+    fn the_decoded_frame_is_no_larger_than_the_image_or_the_pixel_limit() {
+        assert!(decoded_size_ok(8, 8, &params(8, 8)));
+        assert!(decoded_size_ok(4, 8, &params(8, 8)), "a smaller frame is padded later");
+        assert!(!decoded_size_ok(9, 8, &params(8, 8)));
+        assert!(!decoded_size_ok(0, 8, &params(8, 8)));
+        assert!(decoded_size_ok(1 << 14, 1 << 14, &params(1 << 14, 1 << 14)));
+        assert!(!decoded_size_ok(1 << 14, (1 << 14) + 1, &params(1 << 15, 1 << 15)));
+        assert!(!decoded_size_ok(65535, 65535, &params(65535, 65535)));
+        assert_eq!(MAX_DECODED_PIXELS, 1 << 28);
+    }
 }

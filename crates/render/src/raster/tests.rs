@@ -3673,6 +3673,44 @@ trailer << /Root 1 0 R >>
     page(&format!("q 20 0 0 20 5 5 cm /Im1 Do Q {red}"), fax);
 }
 
+/// A JPEG whose 65535 × 65535 frame header follows a 1 × 1 one inside an `FF 01` (TEM) segment
+/// that has a length: hayro-syntax's dimension patch read the hidden 1 × 1 header and left the
+/// data alone, zune-jpeg skipped the segment and decoded the real frame, and the process aborted
+/// on a 12.9 GB allocation when the page was drawn. Vendored hayro-syntax patch 48 checks the
+/// frame the decoder read before decoding; the rest of the page still draws.
+#[test]
+fn a_jpeg_frame_hidden_behind_a_tem_segment_is_refused_before_decoding() {
+    let mut jpeg = vec![0xff, 0xd8, 0xff, 0x01, 0x00, 0x0b];
+    jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01]); // hidden 1 × 1
+    // The real frame: 65535 × 65535, three components.
+    jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08, 0xff, 0xff, 0xff, 0xff, 0x03, 1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+    jpeg.extend_from_slice(&[0xff, 0xdb, 0x00, 0x43, 0x00]);
+    jpeg.extend_from_slice(&[1; 64]);
+    for class in [0x00, 0x10] {
+        jpeg.extend_from_slice(&[0xff, 0xc4, 0x00, 0x14, class, 1]);
+        jpeg.extend_from_slice(&[0; 16]);
+    }
+    jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x0c, 0x03, 1, 0, 2, 0, 3, 0, 0x00, 0x3f, 0x00]);
+    jpeg.extend_from_slice(&[0; 64]);
+    jpeg.extend_from_slice(&[0xff, 0xd9]);
+    let content = "q 20 0 0 20 5 5 cm /Im1 Do Q 1 0 0 rg 0 0 4 4 re f";
+    let mut pdf = format!(
+        "%PDF-1.7\n\
+1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n\
+2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n\
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >> endobj\n\
+4 0 obj << /Length {} >> stream\n{content}\nendstream endobj\n\
+5 0 obj << /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >> stream\n",
+        content.len(),
+        jpeg.len()
+    )
+    .into_bytes();
+    pdf.extend_from_slice(&jpeg);
+    pdf.extend_from_slice(b"\nendstream endobj\ntrailer << /Root 1 0 R >>\n%%EOF");
+    let page = render_first_page(pdf);
+    assert_eq!(&page.rgba[((38 * 40 + 1) * 4)..][..4], &[255, 0, 0, 255], "the rest of the page draws");
+}
+
 /// Scanners and fax services write Group 4 pages with `/Rows 0`, which ISO 32000-2 Table 11
 /// defines as "height not predetermined" (the default), not as zero rows. Such a page used to
 /// render blank. The image is an 8 × 4 all-black Group 4 stream, hand-encoded from ITU-T T.6:
