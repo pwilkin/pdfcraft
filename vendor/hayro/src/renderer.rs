@@ -881,8 +881,38 @@ pub(crate) struct Renderer {
 /// cell is 3.5 MB) drew and kept a cell per fill, which ran out of memory; the fills now share
 /// one. A handful of entries covers a run of fills with one pattern, and bounds what the cache
 /// keeps besides what the scene holds anyway.
+///
+/// PdfCraft patch (35): it also counts the pixels of every cell its renderer drew, kept or not,
+/// against [`MAX_HELD_CELL_PIXELS`] until the renderer is dropped (see [`TilingCells::charge`]).
 #[derive(Default)]
-struct TilingCells(Vec<(TilingCellKey, Arc<Pixmap>)>);
+struct TilingCells {
+    cells: Vec<(TilingCellKey, Arc<Pixmap>)>,
+    held: u64,
+}
+
+/// PdfCraft patch (35): the most pixels of tiling cells the renderers on one thread hold at once,
+/// 2^26 (256 MiB of RGBA; seven cells of the largest size, 3000 px a side). The scene keeps
+/// every cell it is painted with until it is composited, so a page that filled shapes with more
+/// patterns than [`TilingCells`] keeps (or with an uncoloured pattern, whose cells aren't kept)
+/// drew and held a cell per fill: nine patterns of 3000 × 3000 cells, filled in turn, grew by
+/// 36 MB a fill until the process ran out of memory. Past the budget a fill that needs a cell
+/// not yet drawn is left out and the page says so (`InterpreterWarning::ContentTruncated`);
+/// cells already drawn are still taken from `tiling_cells`.
+pub const MAX_HELD_CELL_PIXELS: u64 = 1 << 26;
+
+thread_local! {
+    /// PdfCraft patch (35): the cell pixels the live renderers on this thread hold.
+    static HELD_CELL_PIXELS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// PdfCraft patch (35): whether a fill was left out over [`MAX_HELD_CELL_PIXELS`] since the
+    /// last [`take_cells_left_out`].
+    static CELLS_LEFT_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// PdfCraft patch (35): whether a fill was left out over [`MAX_HELD_CELL_PIXELS`] since the last
+/// call; the page render clears it before drawing and reports it after.
+pub(crate) fn take_cells_left_out() -> bool {
+    CELLS_LEFT_OUT.try_with(|c| c.replace(false)).unwrap_or(false)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct TilingCellKey {
@@ -898,14 +928,44 @@ impl TilingCells {
     const MAX_ENTRIES: usize = 8;
 
     fn get(&self, key: &TilingCellKey) -> Option<Arc<Pixmap>> {
-        self.0.iter().find(|(k, _)| k == key).map(|(_, cell)| cell.clone())
+        self.cells.iter().find(|(k, _)| k == key).map(|(_, cell)| cell.clone())
     }
 
     fn insert(&mut self, key: TilingCellKey, cell: Arc<Pixmap>) {
-        if self.0.len() >= Self::MAX_ENTRIES {
-            self.0.remove(0);
+        if self.cells.len() >= Self::MAX_ENTRIES {
+            self.cells.remove(0);
         }
-        self.0.push((key, cell));
+        self.cells.push((key, cell));
+    }
+
+    /// PdfCraft patch (35): count a cell of `pixels` about to be drawn against
+    /// [`MAX_HELD_CELL_PIXELS`]; `false`, with the page told content was left out, when it
+    /// doesn't fit.
+    fn charge(&mut self, pixels: u64) -> bool {
+        let fits = HELD_CELL_PIXELS
+            .try_with(|held| {
+                let total = held.get().saturating_add(pixels);
+                let fits = total <= MAX_HELD_CELL_PIXELS;
+                if fits {
+                    held.set(total);
+                }
+                fits
+            })
+            .unwrap_or(false);
+        if fits {
+            self.held = self.held.saturating_add(pixels);
+        } else {
+            let _ = CELLS_LEFT_OUT.try_with(|c| c.set(true));
+        }
+        fits
+    }
+}
+
+impl Drop for TilingCells {
+    /// PdfCraft patch (35): the renderer and its scene are gone, and the cells with them.
+    fn drop(&mut self) {
+        let held = self.held;
+        let _ = HELD_CELL_PIXELS.try_with(|h| h.set(h.get().saturating_sub(held)));
     }
 }
 
@@ -1638,6 +1698,7 @@ impl Renderer {
 
     /// PdfCraft patch (30): the cell pixmap of tiling pattern `t`, `size` pixels drawn at
     /// `initial_transform`; a cell with a `key` is drawn once and then taken from `tiling_cells`.
+    /// PdfCraft patch (35): `None` when a cell to draw is past [`MAX_HELD_CELL_PIXELS`].
     fn tiling_cell(
         &mut self,
         t: &hayro_interpret::pattern::TilingPattern<'_>,
@@ -1645,9 +1706,12 @@ impl Renderer {
         size: (u16, u16),
         initial_transform: Affine,
         is_stroke: bool,
-    ) -> Arc<Pixmap> {
+    ) -> Option<Arc<Pixmap>> {
         if let Some(cell) = key.and_then(|key| self.tiling_cells.get(&key)) {
-            return cell;
+            return Some(cell);
+        }
+        if !self.tiling_cells.charge(u64::from(size.0) * u64::from(size.1)) {
+            return None;
         }
         let mut renderer = Self {
             ctx: RenderContext::new_with(size.0, size.1, derive_settings(self.ctx.render_settings())),
@@ -1679,7 +1743,7 @@ impl Renderer {
         if let Some(key) = key {
             self.tiling_cells.insert(key, pix.clone());
         }
-        pix
+        Some(pix)
     }
 
     fn push_clip_path_inner(&mut self, clip_path: &BezPath, fill: FillRule) {
@@ -2043,7 +2107,10 @@ impl Renderer {
                                 pixels: (pix_width, pix_height),
                                 scale: (u64::from(xs.to_bits()), u64::from(ys.to_bits())),
                             });
-                            let pix = self.tiling_cell(&t, key, (pix_width, pix_height), initial_transform, is_stroke);
+                            let Some(pix) = self.tiling_cell(&t, key, (pix_width, pix_height), initial_transform, is_stroke)
+                            else {
+                                return PaintSetup::Nothing;
+                            };
                             paint_transform = path_transform.inverse() * t.matrix * initial_transform.inverse();
                             let image = Image {
                                 image: ImageSource::Pixmap(pix),
@@ -2086,7 +2153,10 @@ impl Renderer {
                             pixels: (pix_width, pix_height),
                             scale: (xs.to_bits(), ys.to_bits()),
                         });
-                        let pix = self.tiling_cell(&t, key, (pix_width, pix_height), initial_transform, is_stroke);
+                        let Some(pix) = self.tiling_cell(&t, key, (pix_width, pix_height), initial_transform, is_stroke)
+                        else {
+                            return PaintSetup::Nothing;
+                        };
 
                         // TODO: Fix these
                         if t.x_step < 0.0 {
