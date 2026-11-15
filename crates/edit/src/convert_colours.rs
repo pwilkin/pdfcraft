@@ -18,6 +18,9 @@
 //! when it cannot re-encode it (indexed, CMYK, not 8-bit, an explicit mask, a matted soft mask,
 //! JPEG 2000 ...); those that are not in the target already are counted in
 //! [`Converted::images_left`].
+//!
+//! Forms drawing forms are followed [`MAX_DEPTH`] deep; a form nested deeper is left as it was,
+//! with what it draws, and counted in [`Converted::forms_left`].
 
 use pdfcraft_content::{Op, parse, serialize_ops};
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
@@ -26,6 +29,11 @@ use std::collections::{HashMap, HashSet};
 use crate::colour::{Space, rgb, space_of};
 use crate::page_streams::PageStreams;
 use crate::{EditError, check, page_list};
+
+/// How deep forms drawing forms are followed: each level is a frame of recursion, and a chain
+/// of nested forms in a hostile file would otherwise overflow the stack (an abort no guard
+/// catches).
+pub const MAX_DEPTH: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColourTarget {
@@ -59,6 +67,9 @@ pub struct Converted {
     pub images: usize,
     /// Pictures not in the target space that could not be re-encoded and are left as they were.
     pub images_left: usize,
+    /// Forms nested deeper than [`MAX_DEPTH`] inside other forms, left as they were with what
+    /// they draw.
+    pub forms_left: usize,
     /// Pages on which something changed.
     pub pages: usize,
 }
@@ -269,6 +280,8 @@ fn cs_resources(doc: &Document, resources: Option<&Dict>) -> Dict {
 struct Run {
     done: HashMap<ObjRef, ObjRef>,
     shared: HashSet<ObjRef>,
+    /// Forms reached only past [`MAX_DEPTH`] so far (one reached higher up later is converted).
+    too_deep: HashSet<ObjRef>,
 }
 
 /// The XObjects (forms and images, and those the forms draw), and appearance streams, that
@@ -333,7 +346,9 @@ fn put(doc: &mut Document, run: &mut Run, r: ObjRef, obj: Object) -> ObjRef {
 /// images through `recolour`. Each object is converted once; one that a page not being
 /// converted draws is converted as a copy, and the returned `/XObject` dictionary, when there
 /// is one, points at the copies (the caller puts it in `resources`' place). When `may_copy` is
-/// false the caller cannot do that, so such objects are left alone.
+/// false the caller cannot do that, so such objects are left alone. `depth` is how many forms
+/// draw `resources`; a form at [`MAX_DEPTH`] is left alone and recorded in `run.too_deep`.
+#[allow(clippy::too_many_arguments)]
 fn convert_xobjects(
     doc: &mut Document,
     resources: Option<&Dict>,
@@ -342,6 +357,7 @@ fn convert_xobjects(
     run: &mut Run,
     result: &mut Converted,
     may_copy: bool,
+    depth: usize,
 ) -> Option<Dict> {
     let xo = resources.and_then(|r| r.get(b"XObject")).map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned())?;
     let mut repointed = xo.clone();
@@ -358,9 +374,17 @@ fn convert_xobjects(
         if !may_copy && run.shared.contains(&r) {
             continue;
         }
+        let Some(s) = stream_of(doc, r) else {
+            run.done.insert(r, r);
+            continue;
+        };
+        if depth >= MAX_DEPTH && s.dict.name(b"Subtype") == Some(b"Form") {
+            // Not marked done: a page or a shallower form may still draw it.
+            run.too_deep.insert(r);
+            continue;
+        }
         // Marked before converting, so a form that draws itself ends.
         run.done.insert(r, r);
-        let Some(s) = stream_of(doc, r) else { continue };
         let stored = match s.dict.name(b"Subtype") {
             Some(b"Form") => {
                 let res = s.dict.get(b"Resources").map(|x| doc.resolve(x)).and_then(|x| x.as_dict().cloned());
@@ -369,7 +393,7 @@ fn convert_xobjects(
                     Ok(data) => rewrite(&data, &mut State::default(), doc, &cs, settings),
                     Err(_) => (None, 0),
                 };
-                let inner = convert_xobjects(doc, res.as_ref(), settings, recolour, run, result, true);
+                let inner = convert_xobjects(doc, res.as_ref(), settings, recolour, run, result, true, depth + 1);
                 if new.is_none() && inner.is_none() {
                     None
                 } else {
@@ -423,7 +447,7 @@ pub fn convert_colours(
     let all = page_list(doc);
     check(pages, all.len())?;
     let mut result = Converted::default();
-    let mut run = Run { done: HashMap::new(), shared: drawn_elsewhere(doc, pages) };
+    let mut run = Run { done: HashMap::new(), shared: drawn_elsewhere(doc, pages), too_deep: HashSet::new() };
     for &i in pages {
         let Some(page) = page_list(doc).get(i).cloned() else { continue };
         let resources = page.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned());
@@ -441,7 +465,7 @@ pub fn convert_colours(
             }
             streams.write(doc, page.obj, new)?;
         }
-        if let Some(xo) = convert_xobjects(doc, resources.as_ref(), settings, recolour, &mut run, &mut result, true) {
+        if let Some(xo) = convert_xobjects(doc, resources.as_ref(), settings, recolour, &mut run, &mut result, true, 0) {
             // This page's own resources point at the copies; a resource dictionary other pages
             // share is not changed.
             let mut res = resources.clone().unwrap_or_default();
@@ -481,12 +505,13 @@ pub fn convert_colours(
                 fake.set(b"XObject".to_vec(), Object::Dict(xo));
                 // An appearance stream other pages draw is left alone (there is no resource
                 // dictionary here to point at a copy).
-                convert_xobjects(doc, Some(&fake), settings, recolour, &mut run, &mut result, false);
+                convert_xobjects(doc, Some(&fake), settings, recolour, &mut run, &mut result, false, 0);
             }
         }
         if (result.colours, result.images) != before {
             result.pages += 1;
         }
     }
+    result.forms_left = run.too_deep.iter().filter(|r| !run.done.contains_key(r)).count();
     Ok(result)
 }
