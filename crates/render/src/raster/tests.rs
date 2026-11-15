@@ -3577,6 +3577,25 @@ fn a_jp2_image_in_a_refused_enumerated_colour_space_is_drawn() {
     }
 }
 
+/// A JPEG 2000 codestream claiming 60000 × 60000 (one component, one tile, no decomposition)
+/// in an image whose dictionary says 1 × 1 allocated 3.6 GB, then aborted the process on a
+/// 14.4 GB allocation when the page was drawn: `image_size_ok` sees only the dictionary.
+/// Vendored hayro-syntax patch 47 refuses the codestream's own size before decoding; the rest of
+/// the page still draws.
+#[test]
+fn a_jpx_codestream_larger_than_its_dictionary_size_is_refused_before_decoding() {
+    let mut pdf = jpx_midpoint_pdf(8, 1);
+    let siz = pdf.windows(4).position(|w| w == [0xff, 0x4f, 0xff, 0x51]).unwrap();
+    // Xsiz, Ysiz, then (after the image offsets) XTsiz, YTsiz: one 60000 × 60000 tile.
+    for at in [8, 12, 24, 28] {
+        pdf[siz + at..siz + at + 4].copy_from_slice(&60000_u32.to_be_bytes());
+    }
+    let mut r = PageRenderer::new(Arc::new(pdf), RenderConfig::default());
+    let page = r.render(RenderRequest { page: 0, kind: RequestKind::Pixels, tile: None, scale: 1.0, tag: 0, ..Default::default() });
+    assert!(page.error.is_none(), "{:?}", page.error);
+    assert_eq!(&page.rgba[((38 * 40 + 1) * 4)..][..4], &[255, 0, 0, 255], "the rest of the page draws");
+}
+
 #[test]
 fn jpx_stream_bit_depth_boundaries_do_not_panic() {
     use hayro::hayro_syntax::bit_reader::BitReader;

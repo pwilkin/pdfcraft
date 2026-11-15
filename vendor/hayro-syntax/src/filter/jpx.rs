@@ -70,6 +70,9 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
         },
     };
     let has_alpha = image.has_alpha();
+    if !decoded_size_ok(width, height, image.color_space().num_channels(), has_alpha) {
+        return None;
+    }
     let bitmap = image.decode().ok()?;
 
     let (mut data, mut alpha) = if !has_alpha {
@@ -108,6 +111,24 @@ pub(crate) fn decode(data: &[u8], params: &ImageDecodeParams) -> Option<FilterRe
             height,
         }),
     })
+}
+
+/// PdfCraft patch (47): the most samples (pixels × channels, alpha included) a JPX image may
+/// decode to. The codestream's own size is what the decoder allocates for, and it may differ from
+/// the dictionary's `/Width` and `/Height`, which `image_size_ok` checked: an 89-byte codestream
+/// claiming 60000 × 60000 under `/Width 1 /Height 1` allocated 3.6 GB, then aborted on 14.4 GB.
+const MAX_DECODED_SAMPLES: u64 = 1 << 28;
+
+/// PdfCraft patch (47): whether an image of `width` × `height` with `channels` colour channels
+/// (and an alpha channel, if `has_alpha`) may be decoded, by [`MAX_DECODED_SAMPLES`].
+fn decoded_size_ok(width: u32, height: u32, channels: u8, has_alpha: bool) -> bool {
+    let channels = u64::from(channels) + u64::from(has_alpha);
+    width > 0
+        && height > 0
+        && u64::from(width)
+            .saturating_mul(u64::from(height))
+            .saturating_mul(channels.max(1))
+            <= MAX_DECODED_SAMPLES
 }
 
 /// PdfCraft patch: (#3179) whether JP2 file `data` has a palette box (`pclr`) in its header box
@@ -242,7 +263,7 @@ fn scale(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, scale, without_refused_enumerated_colour};
+    use super::{MAX_DECODED_SAMPLES, decode, decoded_size_ok, scale, without_refused_enumerated_colour};
     use crate::bit_reader::{BitReader, bit_mask};
     use crate::object::stream::{ImageColorSpace, ImageDecodeParams};
     use alloc::vec::Vec;
@@ -479,5 +500,43 @@ mod tests {
         }
         assert_eq!(bpc(&one_bit_jp2(&palette)), Some(8));
         assert_eq!(bpc(&one_bit_jp2(&[])), Some(1));
+    }
+
+    /// A raw codestream of `width` × `height` with one 8-bit component, one tile, no
+    /// decomposition levels and one empty packet.
+    fn gray_codestream(width: u32, height: u32) -> Vec<u8> {
+        let mut codestream = alloc::vec![0xff, 0x4f, 0xff, 0x51, 0, 41, 0, 0];
+        for value in [width, height, 0, 0, width, height, 0, 0] {
+            codestream.extend_from_slice(&value.to_be_bytes());
+        }
+        codestream.extend_from_slice(&[0, 1, 7, 1, 1]);
+        codestream.extend_from_slice(&[0xff, 0x52, 0, 12, 0, 0, 0, 1, 0, 0, 4, 4, 0, 1]);
+        codestream.extend_from_slice(&[0xff, 0x5c, 0, 4, 0x40, 0x40]);
+        codestream.extend_from_slice(&[0xff, 0x90, 0, 10, 0, 0, 0, 0, 0, 15, 0, 1, 0xff, 0x93, 0]);
+        codestream.extend_from_slice(&[0xff, 0xd9]);
+        codestream
+    }
+
+    /// PdfCraft patch (47): a codestream claiming 60000 × 60000 inside an image whose dictionary
+    /// says 1 × 1 is refused before decoding; it allocated 3.6 GB, then aborted on 14.4 GB.
+    #[test]
+    fn a_codestream_larger_than_the_sample_limit_is_refused_before_decoding() {
+        let params = ImageDecodeParams { width: 1, height: 1, ..ImageDecodeParams::default() };
+        assert!(decode(&gray_codestream(60000, 60000), &params).is_none());
+        // The same codestream at a real size still decodes.
+        let small = decode(&gray_codestream(3, 2), &params).unwrap().image_data.unwrap();
+        assert_eq!((small.width, small.height), (3, 2));
+    }
+
+    #[test]
+    fn the_sample_limit_counts_every_channel() {
+        assert!(decoded_size_ok(1 << 14, 1 << 14, 1, false));
+        assert!(!decoded_size_ok(1 << 14, (1 << 14) + 1, 1, false));
+        assert!(!decoded_size_ok(1 << 14, 1 << 14, 3, false));
+        assert!(!decoded_size_ok(1 << 14, 1 << 14, 1, true));
+        assert!(decoded_size_ok(1 << 13, 1 << 13, 3, true));
+        assert!(!decoded_size_ok(0, 1, 1, false));
+        assert!(!decoded_size_ok(u32::MAX, u32::MAX, u8::MAX, true));
+        assert_eq!(MAX_DECODED_SAMPLES, 1 << 28);
     }
 }
