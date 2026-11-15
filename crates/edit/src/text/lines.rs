@@ -458,7 +458,16 @@ fn text_lines_in(doc: &Document, p: &pdfcraft_model::Page, actual_text: bool, in
     // The streams are one stream in pieces (§7.8.2), split between any two tokens: parse them
     // joined, so an operator whose operands end one piece still has them.
     let pieces = joined(&content_streams(doc, &p.dict)?);
-    let ops = pieces.parse().ops;
+    let parsed = pieces.parse();
+    if parsed.truncated {
+        // Lines read from part of the page would let an edit, a search or the redaction audit
+        // act on a page they have not read.
+        return Err(EditError::Invalid(format!(
+            "the page's content has more than {} operators, too many to read its text",
+            pdfcraft_content::MAX_PARSED_OPS
+        )));
+    }
+    let ops = parsed.ops;
     let properties = res.get(b"Properties").and_then(|o| doc.dict(o)).unwrap_or_default();
     let shown = interpret(doc, &ops, &res, &mut cache, &mut carry, None, actual_text.then_some(&properties))?;
     let mut last: Option<(usize, Pen)> = None; // the stream piece and where its last run ended

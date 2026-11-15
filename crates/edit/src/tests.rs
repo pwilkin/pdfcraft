@@ -15595,3 +15595,13 @@ fn thai_paragraphs_break_the_row_on_unicode_row_breaks() {
         assert_eq!(rows(&doc), ["กข", "ค"], "matching U+{:04X}", u32::from(separator));
     }
 }
+
+/// A page of more operators than the content parser keeps (two bytes each, so a small stream can
+/// hold a great many) is refused, not read in part: text past the bound would be missing from an
+/// edit, a search or the redaction audit.
+#[test]
+fn text_lines_refuse_a_page_past_the_operator_budget() {
+    let doc = text_page(&format!("{}BT /F1 12 Tf 40 400 Td (Target) Tj ET", "n\n".repeat(pdfcraft_content::MAX_PARSED_OPS)));
+    let error = text::text_lines(&doc, 0).unwrap_err();
+    assert!(error.to_string().contains("too many to read"), "{error}");
+}

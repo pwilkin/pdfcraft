@@ -81,7 +81,8 @@ impl Op {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Parsed {
     pub ops: Vec<Op>,
-    /// Bytes that could not be read as operands or operators.
+    /// Bytes that could not be read as operands or operators, or were left unread past
+    /// [`MAX_PARSED_OPS`].
     pub skipped: usize,
     /// Inline images the renderer's tokenizer reads no image for (it stops, or finds no `EI` it
     /// accepts), so their end here is a guess and the operators after them may not be the ones
@@ -92,6 +93,9 @@ pub struct Parsed {
     /// and whether one runs out of it into the next. Only boundaries are recorded, so the size
     /// depends on the number of pieces, not of comments.
     comment_edges: Vec<(bool, bool)>,
+    /// The stream holds more than [`MAX_PARSED_OPS`] operators: `ops` stops there, and the bytes
+    /// from the first operator left out to the end of the stream are counted in `skipped`.
+    pub truncated: bool,
 }
 
 fn is_ws(b: u8) -> bool {
@@ -105,7 +109,16 @@ fn is_delim(b: u8) -> bool {
 /// Longest unreadable number token retried from its next byte. Real numbers are far shorter.
 const MAX_RETRIED_TOKEN: usize = 64;
 
-/// Parse a (decoded) content stream.
+/// Operators [`parse`] keeps. Each costs its own allocation besides its operands, more than a
+/// hundred bytes in all, while a stream can spend two bytes on one (`n\n`): a page decoded to the
+/// 256 MiB budget would otherwise hold tens of gigabytes of them. Dense real pages (maps, CAD
+/// drawings) stay below this, and it matches the operator budgets of the redaction and audit
+/// passes. A caller that needs every operator of a longer stream reads them one at a time with
+/// [`ops`].
+pub const MAX_PARSED_OPS: usize = 2_000_000;
+
+/// Parse a (decoded) content stream, keeping at most [`MAX_PARSED_OPS`] operators (see
+/// [`Parsed::truncated`]).
 pub fn parse(data: &[u8]) -> Parsed {
     parse_pieces(data, &[])
 }
@@ -119,9 +132,25 @@ pub fn ops(data: &[u8]) -> Ops<'_> {
 /// Parse `data`, recording which of the piece boundaries `ends` (as in [`Pieces`]) a comment
 /// crosses.
 fn parse_pieces(data: &[u8], ends: &[usize]) -> Parsed {
+    parse_capped(data, ends, MAX_PARSED_OPS)
+}
+
+/// [`parse_pieces`] keeping at most `max_ops` operators.
+fn parse_capped(data: &[u8], ends: &[usize], max_ops: usize) -> Parsed {
     let mut reader = Ops::new(data, ends);
-    let ops = reader.by_ref().collect();
-    Parsed { ops, skipped: reader.skipped, ambiguous_images: reader.ambiguous_images, comment_edges: reader.comment_edges }
+    let mut ops = Vec::new();
+    let mut truncated = false;
+    for op in reader.by_ref() {
+        if ops.len() >= max_ops {
+            // The rest is not read: counted as skipped, so callers that refuse to rewrite a
+            // stream they could not read in full refuse this one too.
+            truncated = true;
+            reader.skipped = reader.skipped.saturating_add(data.len().saturating_sub(op.span.start));
+            break;
+        }
+        ops.push(op);
+    }
+    Parsed { ops, skipped: reader.skipped, ambiguous_images: reader.ambiguous_images, comment_edges: reader.comment_edges, truncated }
 }
 
 /// The iterator [`ops`] returns.

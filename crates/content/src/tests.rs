@@ -587,3 +587,26 @@ fn invert_accepts_small_scale_and_rejects_singular() {
     // A subnormal scale passes the relative check but its inverse overflows (CodeRabbit on #5703).
     assert!(Matrix([1e-310, 0., 0., 1., 0., 0.]).invert().is_none());
 }
+
+#[test]
+fn parse_keeps_at_most_its_operator_budget() {
+    // `n` is the cheapest operator a stream can hold: two bytes each, against more than a hundred
+    // per parsed operator. A page of them decoded to its budget held tens of gigabytes.
+    let data = b"n\n".repeat(10);
+    let parsed = parse_capped(&data, &[], 4);
+    assert_eq!(parsed.ops.len(), 4);
+    assert!(parsed.truncated);
+    assert_eq!(parsed.skipped, data.len() - 8, "the bytes left unread are counted");
+    let whole = parse_capped(&data, &[], 10);
+    assert_eq!((whole.ops.len(), whole.truncated, whole.skipped), (10, false, 0));
+}
+
+#[test]
+fn parse_stops_at_max_parsed_ops() {
+    let data = b"n\n".repeat(MAX_PARSED_OPS + 3);
+    let parsed = parse(&data);
+    assert_eq!(parsed.ops.len(), MAX_PARSED_OPS);
+    assert!(parsed.truncated);
+    assert_eq!(parsed.skipped, 6);
+    assert!(Pieces::join(&[&data]).parse().truncated, "pieces are bounded too");
+}
